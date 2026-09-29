@@ -18,7 +18,7 @@ import struct
 
 import olefile
 
-DATE_RE = re.compile(r"\d{2}\.\d{2}")
+DATE_RE = re.compile(r"\d{1,2}\.\d{2}")
 
 # Смещения в FIB
 FIB_BASE_FLAGS = 0x0A
