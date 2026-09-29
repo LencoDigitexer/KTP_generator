@@ -1,7 +1,1 @@
-# Python cache files
-__pycache__/
-*.pyc
-
-# Environment and config (common for Python projects)
-.env
-.env.local
+(empty)

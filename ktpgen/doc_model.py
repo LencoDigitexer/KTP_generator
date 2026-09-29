@@ -62,94 +62,71 @@ def _strip_fields(text: str) -> str:
 def parse_lessons_from_text(text: str) -> KtpDocument:
     """Разбирает текст документа на строки-темы с датами.
 
-    Анализируются «строки таблиц»: фрагменты между PARAF/CELL маркерами.
-    Тема считается занятием, если её название начинается с «Тема …».
-    Строки «Кейс …» — разделы (перенумеровываются, но без дат).
+    Текст .doc разбивается по \\x07 (конец ячейки/строки таблицы). Формат строк
+    КТП: [заголовок темы] [''] [теория] [практика] [всего] [дата дд.мм] [''].
+    Строки «Кейс …» — разделы (без дат). Позиции дат в исходном тексте
+    вычисляются точно (offset ячейки), что позволяет безопасно их перезаписать.
     """
     doc = KtpDocument()
-    # Разбиваем по концам строк таблиц (\x07 идёт после каждой ячейки/строки)
-    rows_raw = text.split(CELL_SEP)
-
-    idx = 0
-    current: list[str] = []
-    merged_rows: list[list[str]] = []
-    # Каждая строка таблицы заканчивается одиночным \x07 (TAP), ячейки — тоже \x07.
-    # Проще: идём по ячейкам и группируем по признаку «начинается с номера/Тема/Кейс/Итого».
-    cells = [c.replace("\n", " ").replace(LINE_SEP, " ").strip() for c in rows_raw]
+    # offset каждой ячейки в исходном тексте
+    offsets: list[int] = []
+    off = 0
+    raw_cells = text.split(CELL_SEP)
+    for c in raw_cells:
+        offsets.append(off)
+        off += len(c) + 1
+    cells = [c.replace("\n", " ").replace(LINE_SEP, " ").strip() for c in raw_cells]
 
     lesson_re = re.compile(r"^Тема\s+[\d.]+", re.IGNORECASE)
     case_re = re.compile(r"^Кейс\s+\d", re.IGNORECASE)
     total_re = re.compile(r"^Итого$", re.IGNORECASE)
+    num_re = re.compile(r"^\d{1,3}$")
+    date_re = re.compile(r"^\d{1,2}\.\d{2}$")
 
+    idx = 0
     i = 0
-    while i < len(cells):
+    n = len(cells)
+    while i < n:
         c = cells[i]
-        if lesson_re.match(c) or case_re.match(c):
-            # следующая ячейка может содержать продолжение заголовка + часы;
-            # формат: [заголовок], [''], [теория], [практика], [всего], [дата], ['']
-            title = c
-            j = i + 1
-            nums: list[str] = []
-            date_val = None
-            date_cell_index = None
-            while j < len(cells) and j < i + 8:
-                nxt = cells[j]
-                if lesson_re.match(nxt) or case_re.match(nxt) or total_re.match(nxt):
-                    break
-                m = DATE_RE.fullmatch(nxt)
-                if m and date_val is None and nums:
+        if not (lesson_re.match(c) or case_re.match(c)):
+            i += 1
+            continue
+        title = c
+        nums: list[str] = []
+        date_val: str | None = None
+        date_span: tuple[int, int] | None = None
+        j = i + 1
+        while j < n and j - i <= 14:
+            nxt = cells[j]
+            if lesson_re.match(nxt) or case_re.match(nxt) or total_re.match(nxt):
+                break
+            if date_re.match(nxt):
+                if date_val is None:
                     date_val = nxt
-                    date_cell_index = j
-                    j += 1
-                    continue
-                if re.fullmatch(r"\d{1,3}", nxt):
-                    nums.append(nxt)
-                elif nxt == "":
-                    pass
-                else:
-                    # текст продолжения заголовка
-                    if not nums:
-                        title += " " + nxt
+                    s = offsets[j] + raw_cells[j].find(nxt)
+                    date_span = (s, s + len(nxt))
                 j += 1
-            is_case = bool(case_re.match(c))
-            row = LessonRow(
-                index=(idx := idx + 1),
-                title=title,
-                hours_theory=nums[0] if len(nums) > 0 else "",
-                hours_practice=nums[1] if len(nums) > 1 else "",
-                hours_total=nums[2] if len(nums) > 2 else "",
-                date=date_val,
-                is_case_header=is_case,
-            )
-            doc.lessons.append(row)
-            i = j if j > i else i + 1
-            continue
-        i += 1
-
-    # Позиции дат в исходном тексте сопоставляем строкам-занятиям эвристикой:
-    # дата занятия находится сразу после заголовка темы (в пределах ~250 символов).
-    positions = [(m.start(), m.group()) for m in DATE_RE.finditer(text)]
-    used = set()
-    pi = 0
-    for row in doc.lessons:
-        tpos = text.find(row.title[:30])
-        if tpos < 0:
-            continue
-        best = None
-        for k in range(pi, len(positions)):
-            p, v = positions[k]
-            if p < tpos:
                 continue
-            if p - tpos > 400:
+            if num_re.match(nxt):
+                nums.append(nxt)
+            elif nxt == "":
+                pass
+            elif not nums:
+                title += " " + nxt
+            else:
                 break
-            if row.is_case_header and p - tpos > 60:
-                break
-            best = (k, p, v)
-            break
-        if best:
-            k, p, v = best
-            row.date = v
-            row.date_pos = (p, p + len(v))
-            used.add(k)
-            pi = k + 1
+            j += 1
+        is_case = bool(case_re.match(c))
+        row = LessonRow(
+            index=(idx := idx + 1),
+            title=title,
+            hours_theory=nums[0] if len(nums) > 0 else "",
+            hours_practice=nums[1] if len(nums) > 1 else "",
+            hours_total=nums[2] if len(nums) > 2 else "",
+            date=date_val,
+            date_pos=date_span,
+            is_case_header=is_case,
+        )
+        doc.lessons.append(row)
+        i = j if j > i else i + 1
     return doc
