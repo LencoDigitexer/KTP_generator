@@ -5,3 +5,4 @@ __pycache__/
 # Environment and config (common for Python projects)
 .env
 .env.local
+venv
