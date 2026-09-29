@@ -17,13 +17,16 @@ import argparse
 import datetime
 import os
 import re
+import threading
 import uuid
+import webbrowser
 
 from flask import (Flask, jsonify, render_template, request,
                    send_from_directory)
 
-from ktpgen.pipeline import (InputError, apply_to_document, load_calendar,
-                             load_document, parse_start_date, parse_weekdays,
+from ktpgen.pipeline import (InputError, apply_to_document, calendar_info,
+                             load_calendar_any, load_document,
+                             parse_start_date, parse_weekdays,
                              plan_lessons, run_pipeline, verify_output,
                              WEEKDAY_SHORT)
 
@@ -53,9 +56,12 @@ def index():
     today = datetime.date.today()
     start_year = today.year if today.month >= 9 else today.year + 1
     defaults = {
-        "start": f"01.09.{start_year}",
+        "start_iso": f"{start_year}-09-01",
+        "cal_min": f"{start_year}-08-01",
+        "cal_max": f"{start_year + 1}-09-30",
+        "cal_note": "После загрузки календаря границы и дата подстроятся автоматически.",
         "weekdays": ["вт", "пт"],
-        "out_name": "КТП_готовый.doc",
+        "out_name": "КТП.doc",
     }
     return render_template("index.html", weekdays=list(WEEKDAY_SHORT),
                            defaults=defaults)
@@ -68,10 +74,11 @@ def upload():
     if not f or not f.filename:
         return jsonify(error="Файл не выбран"), 400
     ext = os.path.splitext(f.filename)[1].lower()
-    if kind == "doc" and ext not in (".doc",):
+    if kind == "doc" and ext not in (".doc", ".docx"):
         return jsonify(error="Для плана нужен файл .doc (Word 97-2003)"), 400
-    if kind == "calendar" and ext not in (".xlsx", ".xlsm"):
-        return jsonify(error="Для календаря нужен файл .xlsx"), 400
+    if kind == "calendar" and ext not in (".xlsx", ".xlsm", ".doc", ".docx"):
+        return jsonify(error="Для календаря нужен файл .xlsx "
+                             "(или Word .doc/.docx с сеткой месяцев)"), 400
     token = uuid.uuid4().hex[:8]
     name = f"{token}_{_safe_name(f.filename)}"
     path = os.path.join(UPLOAD_DIR, name)
@@ -80,21 +87,25 @@ def upload():
     info = {"path": path, "name": f.filename, "kind": kind}
     try:
         if kind == "doc":
-            _, doc = load_document(path)
-            rows = doc.session_rows
-            info["lessons"] = len(rows)
-            info["preview"] = [r.title[:80] for r in rows[:5]]
-            if not rows:
-                os.remove(path)
-                return jsonify(error="В документе не распознаны строки занятий "
-                                     "(темы вида «Тема 1.1 …»)."), 400
+            rows = []
+            if ext == ".docx":      # план пишется в .doc; .docx принимаем как календарь
+                cal, _ = load_calendar_any(path)
+                info.update(calendar_info(cal))
+                info["is_calendar"] = True
+            else:
+                _, doc = load_document(path)
+                rows = doc.session_rows
+            if rows:                                   # это план КТП
+                info["lessons"] = len(rows)
+                info["preview"] = [r.title[:80] for r in rows[:5]]
+            elif not info.get("is_calendar"):          # может быть, это календарь в Word?
+                cal, _ = load_calendar_any(path)
+                info.update(calendar_info(cal))
+                info["is_calendar"] = True
         elif kind == "calendar":
-            cal = load_calendar(path)
-            info["working"] = len(cal.working_dates)
-            info["holidays"] = sorted(d.strftime("%d.%m.%Y")
-                                      for d in getattr(cal, "holidays", set()))
-            first, last = cal.working_dates[0], cal.working_dates[-1]
-            info["range"] = f"{first:%d.%m.%Y} — {last:%d.%m.%Y}"
+            cal, ctype = load_calendar_any(path)
+            info["calendar_type"] = ctype
+            info.update(calendar_info(cal))
     except InputError as e:
         os.remove(path)
         return jsonify(error=str(e)), 400
@@ -111,7 +122,7 @@ def preview():
     try:
         weekdays = parse_weekdays(data.get("weekdays", ""))
         start = parse_start_date(data.get("start", ""))
-        cal = load_calendar(data["calendar_path"])
+        cal, _ = load_calendar_any(data["calendar_path"])
         _, doc = load_document(data["doc_path"])
         items, rows, warnings = plan_lessons(doc, cal, weekdays, start)
     except (InputError, KeyError) as e:
@@ -134,7 +145,7 @@ def preview():
 @app.post("/api/generate")
 def generate():
     data = request.get_json(silent=True) or {}
-    out_name = _safe_name(data.get("out_name") or "КТП_готовый.doc")
+    out_name = _safe_name(data.get("out_name") or "КТП.doc")
     if not out_name.lower().endswith(".doc"):
         out_name += ".doc"
     out_path = os.path.join(OUTPUT_DIR, out_name)
@@ -169,13 +180,44 @@ def download(name):
     return send_from_directory(OUTPUT_DIR, name, as_attachment=True)
 
 
+def _open_browser_later(url: str, delay: float = 1.2):
+    """Открывает браузер после старта сервера; если не удалось — печатает ссылку."""
+    def _try():
+        import time
+        time.sleep(delay)
+        opened = False
+        try:
+            opened = webbrowser.open(url, new=2)   # новая вкладка
+        except Exception:
+            opened = False
+        if not opened:
+            for cmd in (("xdg-open", url), ("open", url)):
+                try:
+                    import subprocess
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    opened = True
+                    break
+                except OSError:
+                    continue
+        if not opened:
+            print(f"Откройте ссылку вручную: {url}")
+    threading.Thread(target=_try, daemon=True).start()
+
+
 def main():
     p = argparse.ArgumentParser(description="GUI генератора КТП (Flask)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5000)
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--no-browser", action="store_true",
+                   help="не открывать браузер автоматически")
     args = p.parse_args()
-    print(f"Откройте в браузере: http://{args.host}:{args.port}")
+    show_host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    url = f"http://{show_host}:{args.port}"
+    print(f"Генератор КТП запущен: {url}")
+    if not args.no_browser:
+        _open_browser_later(url)
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 
