@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Генератор КТП — расписание дат по календарю часов</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--ink:#1d2733;--muted:#6b7a8c;--acc:#2563eb;--ok:#16a34a;--warn:#d97706;--err:#dc2626;--line:#e3e8ef}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 "Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+header{background:#0f172a;color:#fff;padding:18px 24px}
+header h1{margin:0;font-size:20px}header p{margin:4px 0 0;color:#9fb0c7;font-size:13px}
+main{max-width:1100px;margin:20px auto;padding:0 16px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h2{margin:0 0 10px;font-size:15px;color:#334155;text-transform:uppercase;letter-spacing:.04em}
+.full{grid-column:1/-1}
+.drop{border:2px dashed #c3cede;border-radius:10px;padding:18px;text-align:center;color:var(--muted);cursor:pointer;transition:.15s}
+.drop:hover,.drop.over{border-color:var(--acc);background:#f0f6ff;color:var(--acc)}
+.drop.loaded{border-style:solid;border-color:var(--ok);color:var(--ink);text-align:left;background:#f2fdf5}
+.drop .name{font-weight:600}.drop .meta{font-size:13px;color:var(--muted);margin-top:4px}
+input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit}
+label.cap{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+.wdays{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.wday{border:1px solid var(--line);border-radius:20px;padding:6px 14px;cursor:pointer;user-select:none;background:#fff}
+.wday.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+button{font:inherit;border:0;border-radius:8px;padding:10px 18px;cursor:pointer}
+button.primary{background:var(--acc);color:#fff}button.primary:disabled{background:#9db4dd;cursor:wait}
+button.ghost{background:#eef2f7;color:#334155}
+#status{margin-top:12px;font-size:14px;white-space:pre-wrap}
+#status.err{color:var(--err)}#status.warn{color:var(--warn)}#status.ok{color:var(--ok)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{position:sticky;top:0;background:#f8fafc;font-size:12px;text-transform:uppercase;color:var(--muted)}
+td.num{width:34px;color:var(--muted)}td.dt{width:86px;font-weight:600;white-space:nowrap}
+td.wd{width:40px;color:var(--muted)}td.old{width:70px;color:#b7c1cd;text-decoration:line-through}
+.tblwrap{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:10px}
+.badge{display:inline-block;background:#eef2f7;border-radius:6px;padding:2px 8px;font-size:12px;margin:2px 4px 2px 0}
+.hint{font-size:12.5px;color:var(--muted);margin-top:8px}
+progress{width:100%;height:8px;margin-top:10px}
+@media(max-width:820px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Генератор КТП</h1>
+  <p>Проставляет даты занятий в плане .doc по календарю часов .xlsx (праздники пропускаются)</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. План КТП (.doc)</h2>
+    <div class="drop" id="dropDoc">Перетащите сюда файл <b>.doc</b><br>или нажмите, чтобы выбрать</div>
+    <input type="file" id="fileDoc" accept=".doc" hidden>
+  </section>
+
+  <section class="card">
+    <h2>2. Календарь часов (.xlsx)</h2>
+    <div class="drop" id="dropCal">Перетащите сюда файл <b>.xlsx</b><br>или нажмите, чтобы выбрать</div>
+    <input type="file" id="fileCal" accept=".xlsx,.xlsm" hidden>
+  </section>
+
+  <section class="card full">
+    <h2>3. Расписание</h2>
+    <label class="cap">Дни недели занятий (можно несколько):</label>
+    <div class="wdays" id="wdays">
+      {%- for wd in weekdays %}
+      <span class="wday{% if wd in defaults.weekdays %} on{% endif %}" data-wd="{{ wd }}">{{ wd }}</span>
+      {%- endfor %}
+    </div>
+    <label class="cap">Дата начала занятий:</label>
+    <input type="text" id="start" value="{{ defaults.start }}" placeholder="дд.мм.гггг">
+    <label class="cap">Имя итогового файла:</label>
+    <input type="text" id="outName" value="{{ defaults.out_name }}">
+    <div class="btns">
+      <button class="primary" id="btnGen" disabled>Сгенерировать и скачать</button>
+      <button class="ghost" id="btnPrev">Предпросмотр дат</button>
+    </div>
+    <progress id="bar" hidden></progress>
+    <div id="status"></div>
+    <div class="hint">Праздничные (красные) дни календаря автоматически пропускаются.
+    Исходный документ не изменяется — создаётся новый файл в папке <code>output/</code>.</div>
+  </section>
+
+  <section class="card full" id="resultCard" hidden>
+    <h2>Результат</h2>
+    <div id="summary"></div>
+    <div class="tblwrap"><table id="tbl">
+      <thead><tr><th>№</th><th>Тема</th><th>Было</th><th>Стало</th><th>День</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+const state = {doc:null, cal:null};
+const $ = s => document.querySelector(s);
+const statusEl = $("#status");
+function setStatus(msg, cls){ statusEl.textContent = msg || ""; statusEl.className = cls || ""; }
+
+function wireDrop(dropId, inputId, kind){
+  const drop = $(dropId), input = $(inputId);
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("dragover", e => {e.preventDefault(); drop.classList.add("over");});
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => {
+    e.preventDefault(); drop.classList.remove("over");
+    if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0], kind, drop);
+  });
+  input.addEventListener("change", () => { if (input.files.length) uploadFile(input.files[0], kind, drop); });
+}
+
+async function uploadFile(file, kind, drop){
+  setStatus("Загрузка файла…");
+  const fd = new FormData(); fd.append("file", file); fd.append("kind", kind);
+  try{
+    const r = await fetch("/api/upload", {method:"POST", body:fd});
+    const j = await r.json();
+    if(!r.ok || j.error){ setStatus(j.error || "Ошибка загрузки", "err"); return; }
+    state[kind] = j;
+    drop.classList.add("loaded");
+    let meta = "";
+    if(kind === "doc") meta = `Занятий распознано: ${j.lessons}` +
+        (j.preview ? " • первые темы: " + j.preview.slice(0,2).map(t=>t.split(".")[0]).join(", ") + "…" : "");
+    else meta = `Рабочих дат: ${j.working} • период: ${j.range} • праздников: ${(j.holidays||[]).length}`;
+    drop.innerHTML = `<div class="name">${j.name}</div><div class="meta">${meta}</div>` +
+                     `<div class="meta">нажмите, чтобы заменить файл</div>`;
+    setStatus(state.doc && state.cal ? "Файлы готовы. Выберите дни недели и дату начала." : "", "ok");
+    updateGen();
+  }catch(e){ setStatus("Сбой загрузки: " + e, "err"); }
+}
+
+function selectedWeekdays(){
+  return [...document.querySelectorAll(".wday.on")].map(el => el.dataset.wd).join(",");
+}
+document.querySelectorAll(".wday").forEach(el =>
+  el.addEventListener("click", () => { el.classList.toggle("on"); }));
+
+function canRun(){ return !!(state.doc && state.cal && selectedWeekdays() && $("#start").value.trim()); }
+function updateGen(){ $("#btnGen").disabled = !canRun(); }
+["start","outName"].forEach(id => $("#"+id).addEventListener("input", updateGen));
+document.querySelectorAll(".wday").forEach(el => el.addEventListener("click", updateGen));
+
+async function payload(){
+  return {doc_path: state.doc.path, calendar_path: state.cal.path,
+          weekdays: selectedWeekdays(), start: $("#start").value.trim(),
+          out_name: $("#outName").value.trim()};
+}
+
+function renderTable(lessons){
+  const tb = $("#tbl tbody"); tb.innerHTML = "";
+  lessons.forEach(l => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="num">${l.index}</td><td>${l.title}</td>` +
+      `<td class="old">${l.old || ""}</td><td class="dt">${l.date}</td><td class="wd">${l.weekday||""}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+$("#btnPrev").addEventListener("click", async () => {
+  if(!canRun()){ setStatus("Загрузите оба файла, выберите дни и дату начала.", "err"); return; }
+  setStatus("Считаю расписание…");
+  const r = await fetch("/api/preview", {method:"POST", headers:{"Content-Type":"application/json"},
+                                          body: JSON.stringify(await payload())});
+  const j = await r.json();
+  if(!r.ok || j.error){ setStatus(j.error, "err"); return; }
+  renderTable(j.lessons);
+  $("#resultCard").hidden = false;
+  $("#summary").innerHTML = `<span class="badge">занятий: ${j.lessons.length}</span>` +
+    `<span class="badge">рабочих дат: ${j.working}</span>` +
+    (j.holidays||[]).slice(0,8).map(h=>`<span class="badge">🔴 ${h}</span>`).join("");
+  setStatus(j.warnings.length ? "Предпросмотр готов. Внимание: " + j.warnings.join(" ") :
+                                "Предпросмотр готов (файл ещё не создан).",
+            j.warnings.length ? "warn" : "ok");
+});
+
+$("#btnGen").addEventListener("click", async () => {
+  setStatus("Генерирую документ…"); $("#btnGen").disabled = true;
+  const r = await fetch("/api/generate", {method:"POST", headers:{"Content-Type":"application/json"},
+                                          body: JSON.stringify(await payload())});
+  const j = await r.json();
+  updateGen();
+  if(!r.ok || j.error){ setStatus(j.error, "err"); return; }
+  renderTable(j.lessons);
+  $("#resultCard").hidden = false;
+  const v = j.verification;
+  $("#summary").innerHTML = `<span class="badge">заменено дат: ${j.replaced}</span>` +
+    `<span class="badge">самопроверка: ${v.ok}/${v.total}</span>` +
+    `<a class="badge" href="${j.download}" style="background:#dcfce7;color:#166534;font-weight:600">⬇ Скачать ${j.saved.split(/[\\/]/).pop()}</a>`;
+  if(j.ok && !j.warnings.length) setStatus("Готово! Файл сохранён: " + j.saved + "\nОткройте его в Word для визуальной проверки.", "ok");
+  else setStatus("Готово с замечаниями:\n" + j.warnings.join("\n"), "warn");
+});
+
+wireDrop("#dropDoc", "#fileDoc", "doc");
+wireDrop("#dropCal", "#fileCal", "cal");
+updateGen();
+</script>
+</body>
+</html>
