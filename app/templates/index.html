@@ -54,8 +54,8 @@ progress{width:100%;height:8px;margin-top:10px}
 
   <section class="card">
     <h2>2. Календарь часов (.xlsx)</h2>
-    <div class="drop" id="dropCal">Перетащите сюда файл <b>.xlsx</b><br>или нажмите, чтобы выбрать</div>
-    <input type="file" id="fileCal" accept=".xlsx,.xlsm" hidden>
+    <div class="drop" id="dropCal">Перетащите сюда файл <b>.xlsx</b> (или <b>.doc/.docx</b> с календарём часов)<br>или нажмите, чтобы выбрать</div>
+    <input type="file" id="fileCal" accept=".xlsx,.xlsm,.doc,.docx" hidden>
   </section>
 
   <section class="card full">
@@ -67,8 +67,9 @@ progress{width:100%;height:8px;margin-top:10px}
       {%- endfor %}
     </div>
     <label class="cap">Дата начала занятий:</label>
-    <input type="text" id="start" value="{{ defaults.start }}" placeholder="дд.мм.гггг">
-    <label class="cap">Имя итогового файла:</label>
+    <input type="date" id="start" value="{{ defaults.start_iso }}" min="{{ defaults.cal_min }}" max="{{ defaults.cal_max }}" lang="ru">
+    <div class="hint" id="calHint">{{ defaults.cal_note }}</div>
+    <label class="cap">Имя итогового файла (по умолчанию — как у плана):</label>
     <input type="text" id="outName" value="{{ defaults.out_name }}">
     <div class="btns">
       <button class="primary" id="btnGen" disabled>Сгенерировать и скачать</button>
@@ -105,28 +106,73 @@ function wireDrop(dropId, inputId, kind){
     e.preventDefault(); drop.classList.remove("over");
     if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0], kind, drop);
   });
-  input.addEventListener("change", () => { if (input.files.length) uploadFile(input.files[0], kind, drop); });
+  input.addEventListener("change", () => {
+    if (!input.files.length) return;
+    const f = input.files[0];
+    if (kind === "calendar"){
+      // в слот календаря можно бросить и .doc/.docx — сервер сам разберётся
+      const isDocExt = /\.docx?$/i.test(f.name);
+      uploadFile(f, isDocExt ? "doc" : "calendar", drop, "cal");
+    } else {
+      uploadFile(f, kind, drop);
+    }
+    input.value = "";   // можно выбрать тот же файл повторно
+  });
 }
 
-async function uploadFile(file, kind, drop){
+// kind — что загружаем ("doc"/"cal"); slot — куда положить в state (по умолчанию kind)
+async function uploadFile(file, kind, drop, slot){
+  slot = slot || kind;
   setStatus("Загрузка файла…");
   const fd = new FormData(); fd.append("file", file); fd.append("kind", kind);
   try{
     const r = await fetch("/api/upload", {method:"POST", body:fd});
     const j = await r.json();
     if(!r.ok || j.error){ setStatus(j.error || "Ошибка загрузки", "err"); return; }
-    state[kind] = j;
+    state[slot] = j;
     drop.classList.add("loaded");
     let meta = "";
-    if(kind === "doc") meta = `Занятий распознано: ${j.lessons}` +
+    if(kind === "doc"){
+      meta = `Занятий распознано: ${j.lessons}` +
         (j.preview ? " • первые темы: " + j.preview.slice(0,2).map(t=>t.split(".")[0]).join(", ") + "…" : "");
-    else meta = `Рабочих дат: ${j.working} • период: ${j.range} • праздников: ${(j.holidays||[]).length}`;
-    drop.innerHTML = `<div class="name">${j.name}</div><div class="meta">${meta}</div>` +
+      if(slot === "doc"){                       // имя итогового файла = имя исходного плана
+        $("#outName").value = defaultOutName(j.name);
+        updateGen();
+      }
+    } else {
+      meta = `Рабочих дат: ${num(j.working)} • период: ${j.range || "—"} • праздников: ${num(j.holidays)}`;
+      if(j.kind === "doc") meta += "  (распознано из Word-файла с таблицами-сетками)";
+      applyCalendarInfo(j);
+    }
+    drop.innerHTML = `<div class="name">${esc(j.name)}</div><div class="meta">${esc(meta)}</div>` +
                      `<div class="meta">нажмите, чтобы заменить файл</div>`;
     setStatus(state.doc && state.cal ? "Файлы готовы. Выберите дни недели и дату начала." : "", "ok");
     updateGen();
   }catch(e){ setStatus("Сбой загрузки: " + e, "err"); }
 }
+
+function num(v){ return (v === undefined || v === null) ? "?" : v; }
+function esc(s){ return String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function defaultOutName(docFileName){
+  const base = String(docFileName || "").split(/[\\/]/).pop().replace(/\.docx?$/i, "");
+  return (base.trim() || "КТП") + ".doc";
+}
+
+/* ---- дата начала: нативный календарь (<input type=date>) ---- */
+const startEl = "#start";
+let startTouched = false;
+function isoToDdmmyyyy(iso){ const p = String(iso||"").split("-"); return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : ""; }
+function setStartInput(iso){ if(iso) $(startEl).value = iso; }
+function applyCalendarInfo(j){
+  // границы выбора даты = период календаря; автоподстановка первой рабочей даты
+  if(j.cal_min){ $(startEl).min = j.cal_min; }
+  if(j.cal_max){ $(startEl).max = j.cal_max; }
+  if(j.range){ $("#calHint").textContent = "Период по календарю: " + j.range; }
+  if(j.start_suggested && !startTouched) setStartInput(j.start_suggested);
+}
+$(startEl).addEventListener("change", () => { startTouched = true; });
 
 function selectedWeekdays(){
   return [...document.querySelectorAll(".wday.on")].map(el => el.dataset.wd).join(",");
@@ -134,14 +180,14 @@ function selectedWeekdays(){
 document.querySelectorAll(".wday").forEach(el =>
   el.addEventListener("click", () => { el.classList.toggle("on"); }));
 
-function canRun(){ return !!(state.doc && state.cal && selectedWeekdays() && $("#start").value.trim()); }
+function canRun(){ return !!(state.doc && state.cal && selectedWeekdays() && $(startEl).value); }
 function updateGen(){ $("#btnGen").disabled = !canRun(); }
 ["start","outName"].forEach(id => $("#"+id).addEventListener("input", updateGen));
 document.querySelectorAll(".wday").forEach(el => el.addEventListener("click", updateGen));
 
 async function payload(){
   return {doc_path: state.doc.path, calendar_path: state.cal.path,
-          weekdays: selectedWeekdays(), start: $("#start").value.trim(),
+          weekdays: selectedWeekdays(), start: isoToDdmmyyyy($(startEl).value),
           out_name: $("#outName").value.trim()};
 }
 
@@ -190,7 +236,7 @@ $("#btnGen").addEventListener("click", async () => {
 });
 
 wireDrop("#dropDoc", "#fileDoc", "doc");
-wireDrop("#dropCal", "#fileCal", "cal");
+wireDrop("#dropCal", "#fileCal", "calendar");
 updateGen();
 </script>
 </body>
