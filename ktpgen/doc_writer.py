@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import io
 import re
 import struct
 
@@ -138,19 +139,86 @@ def rewrite_doc_dates(doc_path_or_bytes, replacements, out_path=None) -> bytes:
     return result
 
 
+def _orig_bytes(src) -> bytes:
+    """Возвращает содержимое исходного .doc (путь / bytes / файл-объект)."""
+    if isinstance(src, bytes):
+        return src
+    if isinstance(src, str):
+        with open(src, "rb") as f:
+            return f.read()
+    pos = src.tell()
+    src.seek(0)
+    data = src.read()
+    src.seek(pos)
+    return data
+
+
 def _save_doc(src, updated_streams: dict[str, bytes], out_path: str):
-    """Сохраняет .doc с заменёнными потоками через olefile write-поддержку нет —
-    поэтому делаем побайтовую замену внутри OLE: читаем все потоки и пересобираем."""
-    import io
-    streams: dict[str, bytes] = {}
-    with olefile.OleFileIO(src) as ole:
-        for en in ole.listdir():
-            name = "/".join(en)
-            data = ole.openstream(en).read()
-            streams[name] = updated_streams.get(name, data)
-    data = _build_ole(streams)
+    """Сохраняет .doc с заменёнными потоками побайтовой перезаписью in-place.
+
+    Размеры заменяемых потоков должны совпадать с исходными (даты пишутся на
+    той же длине), поэтому FAT/DIFAT/структура OLE остаются нетронутыми —
+    меняются только байты данных. Потоки в MiniStream (размер < 4096) пишутся
+    через цепочку мини-секторов.
+    """
+    data = bytearray(_orig_bytes(src))
+
+    with io.BytesIO(bytes(data)) as probe:
+        ole = olefile.OleFileIO(probe)
+        fat = list(ole.fat)
+        sect_size = ole.sectorsize
+        mini_size = ole.minisectorsize
+        cutoff = ole.minisectorcutoff
+        endoc = 0xFFFFFFFE  # ENDOFCHAIN
+
+        def chain_of(start: int, table: list[int]) -> list[int]:
+            ch, s, guard = [], start, 0
+            while s is not None and 0 <= s < len(table) and s != endoc and guard < len(table):
+                ch.append(s)
+                s = table[s]
+                guard += 1
+            return ch
+
+        minifat = list(ole.minifat) if ole.minifat else []
+        root_chain = chain_of(ole.direntries[0].isectStart, fat)
+
+        def write_regular(chain: list[int], newdata: bytes):
+            pos = 0
+            for sect in chain:
+                off = (1 + sect) * sect_size
+                n = min(sect_size, len(newdata) - pos)
+                data[off: off + n] = newdata[pos: pos + n]
+                pos += n
+                if pos >= len(newdata):
+                    break
+
+        def write_mini(mchain: list[int], newdata: bytes):
+            pos = 0
+            for msect in mchain:
+                off_in_ms = msect * mini_size
+                big_i = off_in_ms // sect_size
+                rem = off_in_ms % sect_size
+                phys = (1 + root_chain[big_i]) * sect_size + rem
+                n = min(mini_size, len(newdata) - pos)
+                data[phys: phys + n] = newdata[pos: pos + n]
+                pos += n
+                if pos >= len(newdata):
+                    break
+
+        for path, newdata in updated_streams.items():
+            parts = path.split("/") if isinstance(path, str) else list(path)
+            direntry = ole.direntries[ole._find(parts)]
+            if len(newdata) != direntry.size:
+                raise ValueError(f"Размер потока {path} изменился "
+                                 f"({direntry.size}->{len(newdata)}); in-place невозможен")
+            if direntry.size < cutoff:
+                write_mini(chain_of(direntry.isectStart, minifat), newdata)
+            else:
+                write_regular(chain_of(direntry.isectStart, fat), newdata)
+        ole.close()
+
     with open(out_path, "wb") as f:
-        f.write(data)
+        f.write(bytes(data))
 
 
 # ------------------------------------------------------------- OLE builder
@@ -202,7 +270,7 @@ def _build_ole(streams: dict[str, bytes]) -> bytes:
     fat_bytes = b"".join(struct.pack("<I", x) for x in fat[:fat_sects * 128])
 
     def dir_entry(name, etype, start, size, child=-1, left=-1, right=-1):
-        e = bytearray(128)
+        e = bytearray(132)  # запись directory: 128 байт + 4 байта high size (оверфлов)
         nb = name.encode("utf-16-le") + b"\x00\x00"
         e[0:len(nb)] = nb
         struct.pack_into("<H", e, 64, len(nb))
@@ -211,17 +279,21 @@ def _build_ole(streams: dict[str, bytes]) -> bytes:
         for off, val in ((68, left), (72, right), (76, child)):
             struct.pack_into("<I", e, off, (val & 0xFFFFFFFF) if val >= 0 else ENDOFCHAIN)
         struct.pack_into("<I", e, 120, ENDOFCHAIN if start < 0 else start)
-        struct.pack_into("<Q", e, 124, size)   # low+high 32-bit
+        struct.pack_into("<I", e, 124, size & 0xFFFFFFFF)      # low 32-bit
+        struct.pack_into("<I", e, 128, (size >> 32) & 0xFFFFFFFF)  # high 32-bit
         return e
 
     entries = [dir_entry("Root Entry", 5, -1, 0, child=1 if names else -1)]
     for idx, nm in enumerate(names):
         st, ns = placement[nm]
-        left_i = idx - 1 if idx > 0 else -1
-        right_i = idx + 1 if idx + 1 < len(names) else -1
+        # red-black дерево имён потоков (сравнение utf-16-le)
+        order = sorted(range(len(names)), key=lambda j: names[j].encode("utf-16-le"))
+        pos = order.index(idx)
+        left_i = order[pos - 1] if pos > 0 else -1
+        right_i = order[pos + 1] if pos + 1 < len(order) else -1
         entries.append(dir_entry(nm, 2, st, len(streams[nm]),
                                  left=left_i, right=right_i))
-    dir_bytes = b"".join(bytes(e) for e in entries)
+    dir_bytes = b"".join(bytes(e[:128]) for e in entries)
     dir_bytes = dir_bytes.ljust(dir_sects * SECT, b"\x00")
 
     h = bytearray(SECT)
@@ -240,7 +312,9 @@ def _build_ole(streams: dict[str, bytes]) -> bytes:
     struct.pack_into("<I", h, 0x48, ENDOFCHAIN)     # difat start
     struct.pack_into("<I", h, 0x4C, 0)
     for i in range(109):
-        struct.pack_into("<I", h, 0x4C + 4 + 4 * i,
+        if 0x4C + 4 * i >= 0x44:  # DIFAT начинается с 0x4C и занимает до конца заголовка
+            break
+        struct.pack_into("<I", h, 0x4C + 4 * i,
                          fat_start + i if i < fat_sects else FREESECT)
     struct.pack_into("<I", h, 0x34, 0)              # num ministream sectors
     struct.pack_into("<I", h, 0x18 + 0x18, 0x3E)    # no-op keep signature minor
